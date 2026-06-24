@@ -11,4 +11,4 @@ curl -X PUT "http://localhost:30920/_ingest/pipeline/netflow-redate" -H "Content
 
 # Start data-gen
 pip install pandas numpy elasticsearch faker
-python3 /root/YAF-Workshop/Scripts/e1e_instruqt.py
+python3 /root/YAF-Workshop/Scripts/e1e_instruqt.py --count 5000 --batch 500
