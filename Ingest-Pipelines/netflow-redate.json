@@ -1,0 +1,12 @@
+{
+  "description": "Compresses the FCCX-15 28-hour dataset (Sep 14-15 2015) into a rolling 30-minute window ending at now. The earliest record maps to now-30min, the latest to now. Proportional spacing is preserved so relative timing between flows is maintained. Re-run the reindex each time you want to reset the workshop data to the current window.",
+  "processors": [
+    {
+      "script": {
+        "tag": "redate_timestamp",
+        "lang": "painless",
+        "source": "long origMs = Instant.parse(ctx['@timestamp']).toEpochMilli(); long earliestMs = 1442236004075L; long spanMs = 101925899L; long windowMs = 1800000L; long nowMs = Instant.ofEpochMilli(new Date().getTime()).toEpochMilli(); long offsetMs = origMs - earliestMs; if (offsetMs < 0) { offsetMs = 0L; } if (offsetMs > spanMs) { offsetMs = spanMs; } long newMs = (nowMs - windowMs) + (offsetMs * windowMs / spanMs); ctx['@timestamp'] = Instant.ofEpochMilli(newMs).toString();"
+      }
+    }
+  ]
+}
