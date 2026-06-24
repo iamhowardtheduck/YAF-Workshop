@@ -7,24 +7,35 @@ SMTP/email, flow stats) matching the supplied mapping and bulk-ships them to
 Elasticsearch.
 
 Auth: basic auth (username/password) against an ephemeral VM cluster, read from
-the standard Instruqt-style environment variables:
+environment variables with workshop defaults:
     ELASTICSEARCH_URL       (default http://localhost:30920)
-    ELASTICSEARCH_PASSWORD  (required unless --dry-run)
-    ELASTICSEARCH_USERNAME  (default "elastic")
+    ELASTICSEARCH_USERNAME  (default "instruqt")
+    ELASTICSEARCH_PASSWORD  (default "workshops")
 
 Usage:
-    # env vars ELASTICSEARCH_URL / ELASTICSEARCH_PASSWORD already exported in VM
-    python generate_e1e_instruqt.py --count 5000 --batch 500
+    # Backfill: realistic 7-day traffic curve (diurnal + business-hours),
+    # default peak ~200 EPS so it loads in ~30 min on a 2-hour VM.
+    python generate_e1e_instruqt.py backfill --days 7 --peak-eps 200
 
-    # dry run (print sample docs, no shipping)
-    python generate_e1e_instruqt.py --count 3 --dry-run
+    # Live: sustain ~4000 EPS continuously until Ctrl-C (matches workshop rate).
+    python generate_e1e_instruqt.py live --eps 4000
+
+    # Dry run (print sample docs, no shipping)
+    python generate_e1e_instruqt.py dry-run --count 3
 """
 
 import argparse
+import math
+import multiprocessing as mp
 import os
+import queue
 import random
+import signal
 import sys
+import threading
+import time
 import uuid
+import warnings
 from datetime import datetime, timedelta, timezone
 
 try:
@@ -39,6 +50,10 @@ try:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 except Exception:
     pass
+
+# Silence the harmless "urllib3 (2.x) doesn't match a supported version" notice
+# emitted by `requests` (a transitive dep we don't actually use).
+warnings.filterwarnings("ignore", message=r".*urllib3.*chardet.*")
 
 from faker import Faker
 
@@ -62,12 +77,25 @@ TCP_FLAGS = ["S", "SA", "A", "PA", "FA", "R", "RA", "FPA"]
 SENSOR_TYPES = ["yaf", "super_mediator", "pmacct", "netflow-v9"]
 EXPORTERS = ["sensor-edge-01", "sensor-core-02", "sensor-dmz-03"]
 
-# Pools to create realistic repetition / entity correlation
+# Pools to create realistic repetition / entity correlation.
+# Pre-generating expensive Faker values once (companies, emails, filenames,
+# certs) is both faster at runtime and more realistic — real traffic reuses
+# the same senders, certs, and files rather than inventing unique ones per event.
 SRC_IPS = [fake.ipv4() for _ in range(40)]
 DST_IPS = [fake.ipv4() for _ in range(60)]
 DOMAINS = [fake.domain_name() for _ in range(50)]
 HOSTS = [f"host-{i:03d}" for i in range(1, 26)]
 USER_AGENTS = [fake.user_agent() for _ in range(15)]
+COMPANIES = [fake.company() for _ in range(40)]
+COUNTRY_CODES = [fake.country_code() for _ in range(30)]
+EMAILS = [fake.email() for _ in range(120)]
+FILENAMES = [fake.file_name() for _ in range(60)]
+USERNAMES = [fake.user_name() for _ in range(40)]
+SUBJECTS = [fake.sentence(nb_words=6) for _ in range(80)]
+CA_NAMES = ["DigiCert CA", "Let's Encrypt R3", "GlobalSign", "Sectigo RSA", "Amazon RSA 2048 M02"]
+CERT_DATES = [fake.date_time_this_year().isoformat() for _ in range(50)]
+ANSWER_IPS = [fake.ipv4() for _ in range(80)]
+EXPORTER_IPS = [fake.ipv4() for _ in range(8)]
 
 
 def now_iso(dt: datetime) -> str:
@@ -164,7 +192,7 @@ def add_dns(doc: dict):
         "QRType": random.choice(DNS_QTYPES),
         "response_code": random.choice(DNS_RCODES),
         "question": {"name": qname},
-        "A": fake.ipv4() if random.random() > 0.3 else None,
+        "A": random.choice(ANSWER_IPS) if random.random() > 0.3 else None,
         "TTL": str(random.choice([60, 300, 3600, 86400])),
         "answers": {"ttl": str(random.choice([60, 300, 3600]))},
     }
@@ -213,13 +241,12 @@ def add_tls(doc: dict):
         "client": {
             "server_name": sni,
             "x509": {
-                "subject": {"common_name": sni, "organization": fake.company(),
-                            "country": fake.country_code()},
-                "issuer": {"common_name": random.choice(
-                    ["DigiCert CA", "Let's Encrypt R3", "GlobalSign"]),
-                    "organization": fake.company()},
-                "not_before": fake.date_time_this_year().isoformat(),
-                "not_after": fake.date_time_this_year().isoformat(),
+                "subject": {"common_name": sni, "organization": random.choice(COMPANIES),
+                            "country": random.choice(COUNTRY_CODES)},
+                "issuer": {"common_name": random.choice(CA_NAMES),
+                           "organization": random.choice(COMPANIES)},
+                "not_before": random.choice(CERT_DATES),
+                "not_after": random.choice(CERT_DATES),
                 "serial_number": uuid.uuid4().hex,
                 "public_key_algorithm": random.choice(["RSA", "EC"]),
                 "public_key_size": str(random.choice([2048, 256, 384, 4096])),
@@ -234,7 +261,7 @@ def add_ftp(doc: dict):
     doc["event"]["category"] = "file"
     doc["event"]["type"] = "access"
     doc["ftp"] = {
-        "User_name": fake.user_name(),
+        "User_name": random.choice(USERNAMES),
         "User_password": "********",
         "Data_type": random.choice(["ASCII", "Binary", "Image"]),
         "Response_code": random.choice(["200", "230", "331", "425", "530"]),
@@ -245,17 +272,17 @@ def add_ftp(doc: dict):
 def add_email(doc: dict):
     doc["event"]["category"] = "email"
     doc["event"]["type"] = "info"
-    frm = fake.email()
-    to = fake.email()
+    frm = random.choice(EMAILS)
+    to = random.choice(EMAILS)
     doc["email"] = {
         "from": {"address": frm},
         "to": {"address": to},
-        "subject": fake.sentence(nb_words=6),
+        "subject": random.choice(SUBJECTS),
         "content_type": random.choice(["text/plain", "text/html", "multipart/mixed"]),
         "Size": str(random.randint(500, 5_000_000)),
-        "Hello": fake.domain_name(),
+        "Hello": random.choice(DOMAINS),
         "Response": random.choice(["250 OK", "550 No such user", "421 Service unavailable"]),
-        "attachments": {"file": {"name": fake.file_name()}} if random.random() > 0.6 else {},
+        "attachments": {"file": {"name": random.choice(FILENAMES)}} if random.random() > 0.6 else {},
     }
 
 
@@ -271,7 +298,7 @@ def add_flow_stats(doc: dict):
         "meanFlowRate": random.randint(0, 100000),
         "meanPacketRate": random.randint(0, 1_000_000),
         "exporterName": random.choice(EXPORTERS),
-        "exporterIPv4Address": fake.ipv4(),
+        "exporterIPv4Address": random.choice(EXPORTER_IPS),
         "observationDomainId": random.randint(1, 10),
         "exportingProcessId": random.randint(1000, 9999),
     }
@@ -296,6 +323,7 @@ def make_doc(ts: datetime) -> dict:
 
 
 def gen_docs(count: int, span_minutes: int):
+    """Legacy helper: `count` docs spread across the last `span_minutes`."""
     start = datetime.now(timezone.utc) - timedelta(minutes=span_minutes)
     for i in range(count):
         offset = (span_minutes * 60) * (i / max(count, 1))
@@ -303,60 +331,350 @@ def gen_docs(count: int, span_minutes: int):
         yield make_doc(ts)
 
 
-def main():
-    p = argparse.ArgumentParser(description="Generate events for the e1e-instruqt data stream")
-    p.add_argument("--count", type=int, default=1000, help="number of events")
-    p.add_argument("--batch", type=int, default=500, help="bulk batch size")
-    p.add_argument("--span-minutes", type=int, default=60,
-                   help="spread timestamps over the last N minutes")
-    p.add_argument("--index", default=DATA_STREAM, help="target data stream / index")
-    p.add_argument("--dry-run", action="store_true", help="print sample docs, do not ship")
-    args = p.parse_args()
+# --------------------------------------------------------------------------- #
+#  Traffic-shape model (shared by backfill)                                    #
+# --------------------------------------------------------------------------- #
 
-    if args.dry_run:
-        import json
-        for d in gen_docs(min(args.count, 5), args.span_minutes):
-            print(json.dumps(d, indent=2))
-        return
+def eps_at(ts: datetime, peak_eps: float, trough_eps: float) -> float:
+    """Events-per-second at a given timestamp following a realistic curve:
+    diurnal sine peaking ~13:00, a business-hours boost (09-17 weekdays),
+    and weekend dampening."""
+    hour = ts.hour + ts.minute / 60.0
+    weekend = ts.weekday() >= 5
+    day_scale = 0.4 if weekend else 1.0
+    diurnal = (math.sin((hour - 7) / 24 * 2 * math.pi) + 1) / 2     # 0..1
+    biz = 1.0 + (0.6 if (9 <= hour <= 17 and not weekend) else 0.0)
+    eps = trough_eps + (peak_eps - trough_eps) * diurnal * biz * day_scale
+    return max(trough_eps, min(eps, peak_eps))
 
+
+def backfill_docs(days: int, peak_eps: float, trough_eps: float, bucket_s: int = 60):
+    """Yield docs for the past `days`, generating each `bucket_s`-second bucket
+    with a count derived from the traffic curve at that bucket's time."""
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=days)
+    t = start
+    while t < now:
+        rate = eps_at(t, peak_eps, trough_eps)
+        n = max(0, int(random.gauss(rate * bucket_s, rate * bucket_s * 0.1)))
+        for _ in range(n):
+            ts = t + timedelta(seconds=random.uniform(0, bucket_s))
+            yield make_doc(ts)
+        t += timedelta(seconds=bucket_s)
+
+
+def estimate_backfill(days: int, peak_eps: float, trough_eps: float) -> int:
+    total = 0
+    now = datetime.now(timezone.utc)
+    t = now - timedelta(days=days)
+    while t < now:
+        total += eps_at(t, peak_eps, trough_eps) * 3600
+        t += timedelta(hours=1)
+    return int(total)
+
+
+# --------------------------------------------------------------------------- #
+#  Elasticsearch connection                                                    #
+# --------------------------------------------------------------------------- #
+
+def connect(announce=True):
     if Elasticsearch is None:
         sys.exit("elasticsearch package not installed. Run: pip install elasticsearch")
-
     es_url = os.environ.get("ELASTICSEARCH_URL", "http://localhost:30920")
-    username = os.environ.get("ELASTICSEARCH_USERNAME", "elastic")
-    password = os.environ.get("ELASTICSEARCH_PASSWORD")
-    if not password:
-        sys.exit("Set ELASTICSEARCH_PASSWORD (and optionally ELASTICSEARCH_URL / "
-                 "ELASTICSEARCH_USERNAME) environment variables.")
-
+    username = os.environ.get("ELASTICSEARCH_USERNAME", "instruqt")
+    password = os.environ.get("ELASTICSEARCH_PASSWORD", "workshops")
     es = Elasticsearch(
         es_url,
         basic_auth=(username, password),
-        request_timeout=30,
-        verify_certs=False,   # ephemeral VM, http/self-signed friendly
-    )
+        verify_certs=False,
+    ).options(request_timeout=60, retry_on_timeout=True, max_retries=3)
+    if announce:
+        try:
+            info = es.info()
+        except Exception as e:
+            msg = str(e)
+            if "401" in msg or "authenticate" in msg:
+                sys.exit(
+                    f"Authentication failed for user '{username}' at {es_url}.\n"
+                    f"  Verify credentials, e.g.:\n"
+                    f"    curl -u {username}:<password> {es_url}\n"
+                    f"  then set ELASTICSEARCH_USERNAME / ELASTICSEARCH_PASSWORD.")
+            sys.exit(f"Could not reach Elasticsearch at {es_url}: {e}")
+        print(f"Connected to {es_url} | cluster '{info['cluster_name']}' "
+              f"| version {info['version']['number']} | user '{username}'", flush=True)
+    return es
 
-    info = es.info()
-    print(f"Connected to {es_url} | cluster '{info['cluster_name']}' "
-          f"| version {info['version']['number']}")
 
-    def actions():
-        for doc in gen_docs(args.count, args.span_minutes):
-            # create op -> required for data streams (append-only)
-            yield {"_op_type": "create", "_index": args.index, "_source": doc}
+def to_action(index, doc):
+    # `create` op -> required for append-only data streams
+    return {"_op_type": "create", "_index": index, "_source": doc}
 
-    ok, errors = 0, []
-    for success, info in helpers.streaming_bulk(
-        es, actions(), chunk_size=args.batch, raise_on_error=False
-    ):
-        if success:
-            ok += 1
+
+# --------------------------------------------------------------------------- #
+#  Parallel bulk shipper (used by both backfill and live)                      #
+# --------------------------------------------------------------------------- #
+
+class Shipper:
+    """Fan a doc stream out to N worker threads doing parallel bulk indexing.
+    Generation runs on the main thread; workers pull from a bounded queue."""
+
+    def __init__(self, es, index, workers=4, batch=2000, queue_batches=8):
+        self.es = es
+        self.index = index
+        self.batch = batch
+        self.q = queue.Queue(maxsize=queue_batches)
+        self.workers = [threading.Thread(target=self._worker, daemon=True)
+                        for _ in range(workers)]
+        self.lock = threading.Lock()
+        self.ok = 0
+        self.failed = 0
+        self.first_error = None
+        self.stop = threading.Event()
+
+    def start(self):
+        for w in self.workers:
+            w.start()
+
+    def _worker(self):
+        while not self.stop.is_set():
+            try:
+                chunk = self.q.get(timeout=1)
+            except queue.Empty:
+                continue
+            if chunk is None:
+                self.q.task_done()
+                break
+            actions = [to_action(self.index, d) for d in chunk]
+            try:
+                ok, errs = helpers.bulk(self.es, actions, raise_on_error=False)
+                with self.lock:
+                    self.ok += ok
+                    if errs:
+                        self.failed += len(errs)
+                        if self.first_error is None:
+                            self.first_error = errs[0]
+            except Exception as e:
+                with self.lock:
+                    self.failed += len(actions)
+                    if self.first_error is None:
+                        self.first_error = repr(e)
+            finally:
+                self.q.task_done()
+
+    def submit(self, chunk):
+        self.q.put(chunk)
+
+    def close(self):
+        for _ in self.workers:
+            self.q.put(None)
+        for w in self.workers:
+            w.join()
+
+
+def chunked(it, size):
+    chunk = []
+    for x in it:
+        chunk.append(x)
+        if len(chunk) >= size:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
+
+
+# --------------------------------------------------------------------------- #
+#  Modes                                                                        #
+# --------------------------------------------------------------------------- #
+
+def run_backfill(args):
+    est = estimate_backfill(args.days, args.peak_eps, args.trough_eps)
+    procs = args.procs
+    print(f"Backfill plan: {args.days} days, peak {args.peak_eps} EPS, "
+          f"trough {args.trough_eps} EPS  ->  ~{est:,} events", flush=True)
+    print(f"Spawning {procs} generator processes x {args.workers} ship threads each",
+          flush=True)
+    connect()  # validate connectivity / print banner once from the parent
+
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=args.days)
+    total_s = (now - start).total_seconds()
+    slice_s = total_s / procs
+
+    result_q = mp.Queue()
+    jobs = []
+    for i in range(procs):
+        w_start = start + timedelta(seconds=slice_s * i)
+        w_end = start + timedelta(seconds=slice_s * (i + 1))
+        p = mp.Process(target=_backfill_worker,
+                       args=(i, w_start, w_end, args, result_q))
+        p.start()
+        jobs.append(p)
+
+    t0 = time.time()
+    ok = failed = 0
+    first_error = None
+    for _ in jobs:
+        r = result_q.get()
+        ok += r["ok"]
+        failed += r["failed"]
+        first_error = first_error or r["first_error"]
+    for p in jobs:
+        p.join()
+
+    elapsed = time.time() - t0
+    print(f"Backfill done: indexed {ok:,}, failed {failed:,} in {elapsed:.0f}s "
+          f"({ok/elapsed:,.0f} docs/s) into '{args.index}'", flush=True)
+    if first_error:
+        print(f"  first error: {first_error}", flush=True)
+
+
+def _backfill_worker(wid, w_start, w_end, args, result_q):
+    # Each process re-seeds RNG so slices aren't identical.
+    random.seed(os.getpid() ^ int(time.time() * 1000) ^ wid)
+    es = connect(announce=False)
+    shipper = Shipper(es, args.index, workers=args.workers, batch=args.batch)
+    shipper.start()
+    sent = 0
+    t0 = time.time()
+    for chunk in chunked(_backfill_slice(w_start, w_end, args.peak_eps,
+                                         args.trough_eps), args.batch):
+        shipper.submit(chunk)
+        sent += len(chunk)
+        if wid == 0 and sent % (args.batch * 50) == 0:
+            el = time.time() - t0
+            print(f"  [p0] {sent:,} generated ({sent/el:,.0f} docs/s/proc)", flush=True)
+    shipper.close()
+    result_q.put({"ok": shipper.ok, "failed": shipper.failed,
+                  "first_error": shipper.first_error})
+
+
+def _backfill_slice(w_start, w_end, peak_eps, trough_eps, bucket_s=60):
+    """Like backfill_docs but bounded to [w_start, w_end) for one process."""
+    t = w_start
+    while t < w_end:
+        rate = eps_at(t, peak_eps, trough_eps)
+        n = max(0, int(random.gauss(rate * bucket_s, rate * bucket_s * 0.1)))
+        for _ in range(n):
+            ts = t + timedelta(seconds=random.uniform(0, bucket_s))
+            yield make_doc(ts)
+        t += timedelta(seconds=bucket_s)
+
+
+def run_live(args):
+    procs = args.procs
+    per_proc_eps = args.eps / procs
+    print(f"Live mode: targeting ~{args.eps:,.0f} EPS into '{args.index}' "
+          f"across {procs} processes (~{per_proc_eps:,.0f} EPS each). "
+          f"Press Ctrl-C to stop.", flush=True)
+    connect()  # banner + connectivity check from parent
+
+    stop = mp.Event()
+    result_q = mp.Queue()
+    jobs = []
+    for i in range(procs):
+        p = mp.Process(target=_live_worker, args=(i, per_proc_eps, args, stop, result_q))
+        p.start()
+        jobs.append(p)
+
+    # Parent handles Ctrl-C and signals all children to drain.
+    def handle_sigint(signum, frame):
+        print("\nStopping (draining)...", flush=True)
+        stop.set()
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    for p in jobs:
+        p.join()
+
+    total = ok = failed = 0
+    first_error = None
+    while not result_q.empty():
+        r = result_q.get()
+        total += r["total"]; ok += r["ok"]; failed += r["failed"]
+        first_error = first_error or r["first_error"]
+    print(f"Live stopped: {total:,} generated, indexed {ok:,}, failed {failed:,}",
+          flush=True)
+    if first_error:
+        print(f"  first error: {first_error}", flush=True)
+
+
+def _live_worker(wid, eps, args, stop, result_q):
+    random.seed(os.getpid() ^ int(time.time() * 1000) ^ wid)
+    # Children ignore SIGINT directly; parent sets the shared stop event.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    es = connect(announce=False)
+    shipper = Shipper(es, args.index, workers=args.workers, batch=args.batch)
+    shipper.start()
+
+    tick = 0.25
+    per_tick = max(1, int(eps * tick))
+    t0 = time.time()
+    next_t = t0
+    total = 0
+    last_report = t0
+    while not stop.is_set():
+        now = time.time()
+        batch = [make_doc(datetime.now(timezone.utc)) for _ in range(per_tick)]
+        for c in chunked(batch, args.batch):
+            shipper.submit(c)
+        total += len(batch)
+        next_t += tick
+        sleep = next_t - time.time()
+        if sleep > 0:
+            time.sleep(sleep)
         else:
-            errors.append(info)
+            next_t = time.time()
+        if wid == 0 and now - last_report >= 5:
+            el = now - t0
+            # report aggregate estimate (this proc x procs)
+            print(f"  live[p0]: {total:,} sent this proc, "
+                  f"~{total/el:,.0f} EPS/proc, indexed {shipper.ok:,}, "
+                  f"failed {shipper.failed:,}", flush=True)
+            last_report = now
 
-    print(f"Indexed {ok}/{args.count} into '{args.index}'")
-    if errors:
-        print(f"{len(errors)} errors; first: {errors[0]}")
+    shipper.close()
+    result_q.put({"total": total, "ok": shipper.ok, "failed": shipper.failed,
+                  "first_error": shipper.first_error})
+
+
+def run_dry(args):
+    import json
+    for d in gen_docs(min(args.count, 5), 60):
+        print(json.dumps(d, indent=2))
+
+
+# --------------------------------------------------------------------------- #
+#  CLI                                                                          #
+# --------------------------------------------------------------------------- #
+
+def main():
+    default_procs = max(1, (os.cpu_count() or 4) - 2)
+    p = argparse.ArgumentParser(description="Event generator for the e1e-instruqt data stream")
+    p.add_argument("--index", default=DATA_STREAM, help="target data stream / index")
+    p.add_argument("--batch", type=int, default=2000, help="bulk batch size")
+    p.add_argument("--procs", type=int, default=default_procs,
+                   help=f"generator processes (default {default_procs}: cores-2)")
+    p.add_argument("--workers", type=int, default=3,
+                   help="bulk ship threads PER process (default 3)")
+    sub = p.add_subparsers(dest="mode", required=True)
+
+    b = sub.add_parser("backfill", help="generate a realistic N-day history")
+    b.add_argument("--days", type=int, default=7)
+    b.add_argument("--peak-eps", type=float, default=200,
+                   help="peak events/sec at midday weekdays (default 200, ~56M/7d)")
+    b.add_argument("--trough-eps", type=float, default=8,
+                   help="overnight floor events/sec (default 8)")
+    b.set_defaults(func=run_backfill)
+
+    l = sub.add_parser("live", help="sustain a target EPS until Ctrl-C")
+    l.add_argument("--eps", type=float, default=4000, help="target events/sec (default 4000)")
+    l.set_defaults(func=run_live)
+
+    d = sub.add_parser("dry-run", help="print sample docs, do not ship")
+    d.add_argument("--count", type=int, default=3)
+    d.set_defaults(func=run_dry)
+
+    args = p.parse_args()
+    args.func(args)
 
 
 if __name__ == "__main__":
